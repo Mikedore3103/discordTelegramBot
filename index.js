@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client, GatewayIntentBits } from "discord.js";
 import TelegramBot from "node-telegram-bot-api";
+import { createClient as createRedisClient } from "redis";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -15,18 +16,20 @@ const config = {
   telegramChatId: process.env.TELEGRAM_CHAT_ID?.trim(),
   debugTelegramUpdates: process.env.DEBUG_TELEGRAM_UPDATES === "true",
   allowedChannelIds: parseList(process.env.DISCORD_ALLOWED_CHANNEL_IDS),
+  redisUrl: process.env.REDIS_URL?.trim(),
 };
 
 validateConfig(config);
 
 const telegramBot = createTelegramBot(config.telegramBotToken);
 const discordClient = createDiscordClient();
+const redisClient = createRedisConnection(config.redisUrl);
 
 registerTelegramHandlers(telegramBot, config);
-registerDiscordHandlers(discordClient, telegramBot, config);
-registerProcessHandlers(discordClient, telegramBot);
+registerDiscordHandlers(discordClient, telegramBot, config, redisClient);
+registerProcessHandlers(discordClient, telegramBot, redisClient);
 
-await startBots(discordClient, telegramBot, config);
+await startBots(discordClient, telegramBot, redisClient, config);
 
 function loadEnvFile(envPath) {
   if (!fs.existsSync(envPath)) {
@@ -143,6 +146,24 @@ function createDiscordClient() {
   });
 }
 
+function createRedisConnection(redisUrl) {
+  if (isPlaceholder(redisUrl)) {
+    return null;
+  }
+
+  const client = createRedisClient({ url: redisUrl });
+
+  client.on("error", (error) => {
+    console.error("Redis client error:", error?.message || error);
+  });
+
+  client.on("reconnecting", () => {
+    console.warn("Redis client reconnecting...");
+  });
+
+  return client;
+}
+
 function registerTelegramHandlers(bot, currentConfig) {
   bot.on("polling_error", (error) => {
     console.error("Telegram polling error:", error?.message || error);
@@ -156,7 +177,7 @@ function registerTelegramHandlers(bot, currentConfig) {
   }
 }
 
-function registerDiscordHandlers(client, bot, currentConfig) {
+function registerDiscordHandlers(client, bot, currentConfig, redisClient) {
   client.once("clientReady", () => {
     const guilds = client.guilds.cache.map((guild) => `${guild.id}:${guild.name}`);
 
@@ -173,6 +194,12 @@ function registerDiscordHandlers(client, bot, currentConfig) {
       );
     } else {
       console.log("Forwarding messages from all guild text channels the bot can read.");
+    }
+
+    if (redisClient) {
+      console.log("Redis-backed channel mappings are enabled.");
+    } else {
+      console.log("Redis is not configured. Using TELEGRAM_CHAT_ID for all forwarded messages.");
     }
   });
 
@@ -193,11 +220,17 @@ function registerDiscordHandlers(client, bot, currentConfig) {
         return;
       }
 
+      const targetChatId = await resolveTelegramChatId(
+        message.channel.id,
+        currentConfig.telegramChatId,
+        redisClient,
+      );
       const telegramMessage = formatTelegramMessage(message);
-      await sendTelegramText(bot, currentConfig.telegramChatId, telegramMessage);
+      await sendTelegramText(bot, targetChatId, telegramMessage);
+      await persistForwardingState(redisClient, message, targetChatId);
 
       console.log(
-        `Forwarded Discord message ${message.id} from ${message.author.tag} in #${message.channel.name}`,
+        `Forwarded Discord message ${message.id} from ${message.author.tag} in #${message.channel.name} to Telegram chat ${targetChatId}`,
       );
     } catch (error) {
       console.error("Error forwarding message to Telegram:", error?.message || error);
@@ -219,6 +252,24 @@ function registerDiscordHandlers(client, bot, currentConfig) {
   client.on("shardError", (error) => {
     console.error("Discord shard error:", error);
   });
+}
+
+async function resolveTelegramChatId(channelId, defaultChatId, redisClient) {
+  if (!redisClient?.isOpen) {
+    return defaultChatId;
+  }
+
+  try {
+    const mappedChatId = await redisClient.get(`discord:channel:${channelId}:telegramChatId`);
+
+    if (mappedChatId && /^-?\d+$/.test(mappedChatId)) {
+      return mappedChatId;
+    }
+  } catch (error) {
+    console.error("Failed to resolve Redis channel mapping:", error?.message || error);
+  }
+
+  return defaultChatId;
 }
 
 function formatTelegramMessage(message) {
@@ -255,22 +306,63 @@ async function sendTelegramText(bot, chatId, text) {
   }
 }
 
-function registerProcessHandlers(client, bot) {
+async function persistForwardingState(redisClient, message, targetChatId) {
+  if (!redisClient?.isOpen) {
+    return;
+  }
+
+  const now = new Date().toISOString();
+
+  try {
+    await Promise.all([
+      redisClient.hSet(`discord:channel:${message.channel.id}:meta`, {
+        channelId: message.channel.id,
+        channelName: message.channel.name,
+        guildId: message.guild.id,
+        guildName: message.guild.name,
+        lastMessageId: message.id,
+        lastAuthorTag: message.author.tag,
+        lastForwardedAt: now,
+        targetChatId,
+      }),
+      redisClient.set(
+        "bot:lastForwardedMessage",
+        JSON.stringify({
+          messageId: message.id,
+          channelId: message.channel.id,
+          guildId: message.guild.id,
+          forwardedAt: now,
+          targetChatId,
+        }),
+      ),
+      redisClient.incr("bot:stats:forwardedCount"),
+    ]);
+  } catch (error) {
+    console.error("Failed to persist forwarding state to Redis:", error?.message || error);
+  }
+}
+
+function registerProcessHandlers(client, bot, redisClient) {
   process.on("unhandledRejection", (reason) => {
     console.error("Unhandled rejection:", reason);
   });
 
   process.on("SIGINT", async () => {
-    await shutdown(client, bot, "SIGINT");
+    await shutdown(client, bot, redisClient, "SIGINT");
   });
 
   process.on("SIGTERM", async () => {
-    await shutdown(client, bot, "SIGTERM");
+    await shutdown(client, bot, redisClient, "SIGTERM");
   });
 }
 
-async function startBots(client, bot, currentConfig) {
+async function startBots(client, bot, redisClient, currentConfig) {
   try {
+    if (redisClient) {
+      await redisClient.connect();
+      console.log("Redis connection established.");
+    }
+
     const telegramBotInfo = await bot.getMe();
     console.log(`Telegram bot logged in as ${telegramBotInfo.username}`);
 
@@ -284,7 +376,7 @@ async function startBots(client, bot, currentConfig) {
 
 let isShuttingDown = false;
 
-async function shutdown(client, bot, signal) {
+async function shutdown(client, bot, redisClient, signal) {
   if (isShuttingDown) {
     return;
   }
@@ -302,6 +394,14 @@ async function shutdown(client, bot, signal) {
     client.destroy();
   } catch (error) {
     console.error("Failed to destroy Discord client cleanly:", error?.message || error);
+  }
+
+  try {
+    if (redisClient?.isOpen) {
+      await redisClient.quit();
+    }
+  } catch (error) {
+    console.error("Failed to close Redis cleanly:", error?.message || error);
   }
 
   process.exit(0);
