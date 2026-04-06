@@ -25,7 +25,7 @@ const telegramBot = createTelegramBot(config.telegramBotToken);
 const discordClient = createDiscordClient();
 const redisClient = createRedisConnection(config.redisUrl);
 
-registerTelegramHandlers(telegramBot, config);
+registerTelegramHandlers(telegramBot, config, redisClient);
 registerDiscordHandlers(discordClient, telegramBot, config, redisClient);
 registerProcessHandlers(discordClient, telegramBot, redisClient);
 
@@ -164,9 +164,30 @@ function createRedisConnection(redisUrl) {
   return client;
 }
 
-function registerTelegramHandlers(bot, currentConfig) {
+function registerTelegramHandlers(bot, currentConfig, redisClient) {
   bot.on("polling_error", (error) => {
     console.error("Telegram polling error:", error?.message || error);
+  });
+
+  bot.onText(/^\/chatid(?:@\w+)?$/, async (message) => {
+    await replySafe(
+      bot,
+      message.chat.id,
+      `This Telegram chat id is \`${message.chat.id}\`.`,
+      { parse_mode: "Markdown" },
+    );
+  });
+
+  bot.onText(/^\/link(?:@\w+)?(?:\s+(.+))?$/, async (message, match) => {
+    await handleLinkCommand(bot, redisClient, message, match?.[1]);
+  });
+
+  bot.onText(/^\/unlink(?:@\w+)?(?:\s+(.+))?$/, async (message, match) => {
+    await handleUnlinkCommand(bot, redisClient, message, match?.[1]);
+  });
+
+  bot.onText(/^\/links(?:@\w+)?$/, async (message) => {
+    await handleListLinksCommand(bot, redisClient, message, currentConfig.telegramChatId);
   });
 
   if (currentConfig.debugTelegramUpdates) {
@@ -174,6 +195,172 @@ function registerTelegramHandlers(bot, currentConfig) {
       console.log("--- Telegram incoming message JSON ---");
       console.log(JSON.stringify(message, null, 2));
     });
+  }
+}
+
+async function handleLinkCommand(bot, redisClient, message, argumentText) {
+  if (!redisClient?.isOpen) {
+    await replySafe(
+      bot,
+      message.chat.id,
+      "Redis is not configured for this bot, so `/link` is unavailable right now.",
+      { parse_mode: "Markdown" },
+    );
+    return;
+  }
+
+  const [channelId, explicitChatId] = splitCommandArguments(argumentText);
+  const targetChatId = explicitChatId || String(message.chat.id);
+
+  if (!isDiscordId(channelId)) {
+    await replySafe(
+      bot,
+      message.chat.id,
+      "Usage: `/link <discord_channel_id>` or `/link <discord_channel_id> <telegram_chat_id>`",
+      { parse_mode: "Markdown" },
+    );
+    return;
+  }
+
+  if (!isTelegramChatId(targetChatId)) {
+    await replySafe(
+      bot,
+      message.chat.id,
+      "The Telegram chat id must be numeric.",
+    );
+    return;
+  }
+
+  try {
+    await redisClient.set(`discord:channel:${channelId}:telegramChatId`, targetChatId);
+
+    await replySafe(
+      bot,
+      message.chat.id,
+      [
+        "Link saved.",
+        `Discord channel: \`${channelId}\``,
+        `Telegram chat: \`${targetChatId}\``,
+      ].join("\n"),
+      { parse_mode: "Markdown" },
+    );
+  } catch (error) {
+    console.error("Failed to save Telegram link command:", error?.message || error);
+    await replySafe(bot, message.chat.id, "I couldn't save that link in Redis.");
+  }
+}
+
+async function handleUnlinkCommand(bot, redisClient, message, argumentText) {
+  if (!redisClient?.isOpen) {
+    await replySafe(
+      bot,
+      message.chat.id,
+      "Redis is not configured for this bot, so `/unlink` is unavailable right now.",
+      { parse_mode: "Markdown" },
+    );
+    return;
+  }
+
+  const [channelId] = splitCommandArguments(argumentText);
+
+  if (!isDiscordId(channelId)) {
+    await replySafe(
+      bot,
+      message.chat.id,
+      "Usage: `/unlink <discord_channel_id>`",
+      { parse_mode: "Markdown" },
+    );
+    return;
+  }
+
+  try {
+    const deletedCount = await redisClient.del(`discord:channel:${channelId}:telegramChatId`);
+
+    if (deletedCount === 0) {
+      await replySafe(
+        bot,
+        message.chat.id,
+        `No link was found for Discord channel \`${channelId}\`.`,
+        { parse_mode: "Markdown" },
+      );
+      return;
+    }
+
+    await replySafe(
+      bot,
+      message.chat.id,
+      `Removed link for Discord channel \`${channelId}\`.`,
+      { parse_mode: "Markdown" },
+    );
+  } catch (error) {
+    console.error("Failed to remove Telegram link command:", error?.message || error);
+    await replySafe(bot, message.chat.id, "I couldn't remove that link from Redis.");
+  }
+}
+
+async function handleListLinksCommand(bot, redisClient, message, fallbackChatId) {
+  if (!redisClient?.isOpen) {
+    await replySafe(
+      bot,
+      message.chat.id,
+      "Redis is not configured for this bot, so `/links` is unavailable right now.",
+      { parse_mode: "Markdown" },
+    );
+    return;
+  }
+
+  try {
+    const keys = await redisClient.keys("discord:channel:*:telegramChatId");
+
+    if (keys.length === 0) {
+      await replySafe(
+        bot,
+        message.chat.id,
+        `No Redis links found. Default fallback chat is \`${fallbackChatId}\`.`,
+        { parse_mode: "Markdown" },
+      );
+      return;
+    }
+
+    const lines = ["Current channel links:"];
+
+    for (const key of keys.sort()) {
+      const channelId = key.split(":")[2];
+      const targetChatId = await redisClient.get(key);
+      lines.push(`- \`${channelId}\` -> \`${targetChatId}\``);
+    }
+
+    await replySafe(bot, message.chat.id, lines.join("\n"), { parse_mode: "Markdown" });
+  } catch (error) {
+    console.error("Failed to list Redis links:", error?.message || error);
+    await replySafe(bot, message.chat.id, "I couldn't load the current links from Redis.");
+  }
+}
+
+function splitCommandArguments(argumentText) {
+  if (!argumentText) {
+    return [];
+  }
+
+  return argumentText
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function isDiscordId(value) {
+  return /^\d{16,20}$/.test(value || "");
+}
+
+function isTelegramChatId(value) {
+  return /^-?\d+$/.test(value || "");
+}
+
+async function replySafe(bot, chatId, text, options = {}) {
+  try {
+    await bot.sendMessage(chatId, text, options);
+  } catch (error) {
+    console.error("Failed to send Telegram reply:", error?.message || error);
   }
 }
 

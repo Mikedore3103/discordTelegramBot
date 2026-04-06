@@ -71,6 +71,22 @@ If `REDIS_URL` is set:
 - The bot stores channel metadata at `discord:channel:<DISCORD_CHANNEL_ID>:meta`
 - The bot stores `bot:lastForwardedMessage`
 - The bot increments `bot:stats:forwardedCount`
+- Telegram commands can create and remove channel links directly from chat
+
+### Telegram Commands
+
+When Redis is enabled, the bot supports these commands in Telegram:
+
+- `/chatid`
+  Shows the current Telegram chat id
+- `/link <discord_channel_id>`
+  Links that Discord channel to the Telegram chat where you sent the command
+- `/link <discord_channel_id> <telegram_chat_id>`
+  Links that Discord channel to a specific Telegram chat id
+- `/unlink <discord_channel_id>`
+  Removes a Redis channel mapping
+- `/links`
+  Lists the current Redis channel mappings
 
 Example Redis key for routing a Discord channel to a different Telegram chat:
 

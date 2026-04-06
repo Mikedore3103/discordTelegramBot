@@ -9,10 +9,10 @@
     "start:live": "node scripts/run-bot.js",
     "start:log": "node scripts/run-bot.js --log",
     "test:telegram": "node scripts/test-telegram.js",
-    "pm2:start": "pm2 start ecosystem.config.cjs",
-    "pm2:restart": "pm2 restart discord-telegram-forwarder",
-    "pm2:stop": "pm2 stop discord-telegram-forwarder",
-    "pm2:logs": "pm2 logs discord-telegram-forwarder"
+    "pm2:start": "set PM2_HOME=.pm2&& pm2 start ecosystem.config.cjs",
+    "pm2:restart": "set PM2_HOME=.pm2&& pm2 restart discord-telegram-forwarder",
+    "pm2:stop": "set PM2_HOME=.pm2&& pm2 stop discord-telegram-forwarder",
+    "pm2:logs": "set PM2_HOME=.pm2&& pm2 logs discord-telegram-forwarder"
   },
   "keywords": ["discord", "telegram", "bot", "forwarder"],
   "author": "",
